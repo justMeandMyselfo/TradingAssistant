@@ -17,6 +17,7 @@ import sys
 from .advisor import AdvisorEngine, InvestorProfile
 from .backtest import backtest_dca, backtest_lump_sum
 from .data import get_provider
+from .notify import get_webhook_url, send_alerts, send_message, set_webhook_url
 from .portfolio import PortfolioManager, check_alerts
 
 DISCLAIMER = ("\n⚠ Educational tool — not financial advice. "
@@ -55,8 +56,13 @@ def cmd_advise(args) -> None:
           f"target {profile.target_annual_growth:.0%}/yr, "
           f"{profile.horizon_years:.0f}y horizon, capital {profile.capital:,.0f}")
     print(report.target_comment)
-    print(f"\nSuggested portfolio (expected ~{report.expected_return:.1%}/yr, "
-          f"volatility ≲{report.expected_volatility:.1%}):\n")
+    goal_note = ""
+    if report.goal:
+        goal_note = (f"; Monte Carlo says {report.goal.probability:.0%} chance of "
+                     f"reaching {report.goal.target_value:,.0f} in "
+                     f"{profile.horizon_years:.0f}y")
+    print(f"\nSuggested portfolio (hist. return ~{report.expected_return:.1%}/yr, "
+          f"diversified volatility {report.expected_volatility:.1%}{goal_note}):\n")
     hdr = f"{'SYMBOL':>8} {'WEIGHT':>7} {'AMOUNT':>10} {'SHARES':>10} {'PRICE':>10} {'STOP':>9} {'TARGET':>9}  SCORE"
     print(hdr)
     print("-" * len(hdr))
@@ -146,6 +152,74 @@ def cmd_alerts(args) -> None:
     icons = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
     for a in alerts:
         print(f"{icons.get(a.level.value, '·')} [{a.kind}] {a.message}")
+    if getattr(args, "notify", False):
+        sent = send_alerts(alerts)
+        if sent:
+            print(f"→ {sent} alert(s) sent to Discord.")
+        elif get_webhook_url() is None:
+            print("→ Discord not configured. Run: config discord <webhook-url>")
+        else:
+            print("→ Nothing new to send (all alerts within the dedupe cooldown).")
+
+
+def cmd_watch(args) -> None:
+    """Poll alerts on an interval and push new ones to Discord."""
+    import time
+    if get_webhook_url() is None and args.notify:
+        print("Discord not configured. Run: config discord <webhook-url>")
+        return
+    p = _provider(args)
+    print(f"Watching portfolio every {args.interval}s (Ctrl-C to stop)…")
+    while True:
+        mgr = PortfolioManager()
+        alerts = check_alerts(mgr, p)
+        if alerts:
+            for a in alerts:
+                print(f"[{a.level.value}] {a.message}")
+            if args.notify:
+                sent = send_alerts(alerts)
+                if sent:
+                    print(f"→ {sent} alert(s) sent to Discord.")
+        else:
+            print("✓ no alerts")
+        if args.once:
+            return
+        time.sleep(args.interval)
+
+
+def cmd_config(args) -> None:
+    if args.key == "discord":
+        set_webhook_url(args.value)
+        print("Discord webhook saved to data/config.json")
+
+
+def cmd_notify(args) -> None:
+    if args.action == "test":
+        ok = send_message("✅ Trading Assistant is connected to this channel.")
+        print("Test message sent." if ok else
+              "Failed — set a webhook first: config discord <webhook-url>")
+
+
+def cmd_sync(args) -> None:
+    from .brokers import fetch_ibkr_positions, sync_positions
+    print(f"Connecting to IBKR at {args.host}:{args.port} (read-only)…")
+    positions = fetch_ibkr_positions(host=args.host, port=args.port,
+                                     client_id=args.client_id)
+    if not positions:
+        print("No positions reported by IBKR.")
+        return
+    result = sync_positions(PortfolioManager(), positions, replace=not args.merge)
+    print(f"Synced {len(positions)} position(s): "
+          f"added {result['added'] or '—'}, updated {result['updated'] or '—'}, "
+          f"removed {result['removed'] or '—'}")
+
+
+def cmd_import_csv(args) -> None:
+    from .brokers import import_positions_csv
+    result = import_positions_csv(PortfolioManager(), args.path,
+                                  replace=args.replace)
+    print(f"Imported: added {result['added'] or '—'}, "
+          f"updated {result['updated'] or '—'}, removed {result['removed'] or '—'}")
 
 
 def cmd_backtest(args) -> None:
@@ -212,7 +286,40 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_dca)
 
     al = sub.add_parser("alerts", help="check stop/target/DCA alerts")
+    al.add_argument("--notify", action="store_true", help="push alerts to Discord")
     al.set_defaults(func=cmd_alerts)
+
+    w = sub.add_parser("watch", help="poll alerts on an interval, push to Discord")
+    w.add_argument("--interval", type=int, default=300, help="seconds between checks")
+    w.add_argument("--notify", action="store_true", default=True)
+    w.add_argument("--once", action="store_true", help="single check then exit")
+    w.set_defaults(func=cmd_watch)
+
+    cf = sub.add_parser("config", help="store settings (e.g. Discord webhook)")
+    cf.add_argument("key", choices=["discord"])
+    cf.add_argument("value")
+    cf.set_defaults(func=cmd_config)
+
+    no = sub.add_parser("notify", help="notification utilities")
+    no.add_argument("action", choices=["test"])
+    no.set_defaults(func=cmd_notify)
+
+    sy = sub.add_parser("sync", help="pull live positions from IBKR (TWS/Gateway)")
+    sy.add_argument("broker", choices=["ibkr"])
+    sy.add_argument("--host", default="127.0.0.1")
+    sy.add_argument("--port", type=int, default=7497,
+                    help="7497 TWS paper, 7496 TWS live, 4002/4001 Gateway")
+    sy.add_argument("--client-id", type=int, default=17)
+    sy.add_argument("--merge", action="store_true",
+                    help="only add/update — don't remove local positions missing at the broker")
+    sy.set_defaults(func=cmd_sync)
+
+    ic = sub.add_parser("import-csv", help="import positions from a CSV "
+                                           "(Trade Republic & others)")
+    ic.add_argument("path")
+    ic.add_argument("--replace", action="store_true",
+                    help="mirror the file exactly instead of merging")
+    ic.set_defaults(func=cmd_import_csv)
 
     bt = sub.add_parser("backtest", help="DCA vs lump-sum backtest")
     bt.add_argument("symbol")

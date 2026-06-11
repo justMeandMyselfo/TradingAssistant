@@ -20,6 +20,7 @@ from trading_assistant.advisor.universe import UNIVERSE                       # 
 from trading_assistant.analysis.indicators import bollinger, ema, macd, rsi, sma  # noqa: E402
 from trading_assistant.backtest import backtest_dca, backtest_lump_sum        # noqa: E402
 from trading_assistant.data import get_provider                               # noqa: E402
+from trading_assistant import notify                                          # noqa: E402
 from trading_assistant.portfolio import PortfolioManager, check_alerts       # noqa: E402
 
 st.set_page_config(page_title="Trading Assistant", page_icon="📈", layout="wide")
@@ -186,10 +187,21 @@ with tab_advisor:
     if report:
         profile = report.profile
         (st.success if report.target_feasible else st.warning)(report.target_comment)
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Profile", profile.label)
         m2.metric("Expected return (hist.)", f"{report.expected_return:.1%}/yr")
-        m3.metric("Portfolio volatility ≲", f"{report.expected_volatility:.1%}")
+        m3.metric("Portfolio volatility", f"{report.expected_volatility:.1%}",
+                  help="Correlation-aware: computed from the covariance of the "
+                       "picks' daily returns, so diversification is credited.")
+        if report.goal:
+            m4.metric("Chance of hitting target", f"{report.goal.probability:.0%}",
+                      help=f"Monte Carlo (5,000 paths) probability that "
+                           f"{profile.capital:,.0f} grows to "
+                           f"{report.goal.target_value:,.0f} in "
+                           f"{profile.horizon_years:.0f}y. Uses a return estimate "
+                           f"shrunk toward a 7% market prior "
+                           f"({report.goal.expected_return_used:.1%}) to avoid "
+                           f"extrapolating a lucky past.")
 
         rows = [{"Symbol": r.asset.symbol, "Name": r.asset.name,
                  "Class": r.asset.asset_class, "Sector": r.asset.sector,
@@ -236,6 +248,31 @@ with tab_advisor:
                                yaxis_title="Historical CAGR %", height=420,
                                margin=dict(t=50, b=10))
             st.plotly_chart(scat, use_container_width=True)
+
+        if report.goal:
+            g = report.goal
+            months = g.percentile_curves.index
+            fan = go.Figure()
+            fan.add_trace(go.Scatter(x=months, y=g.percentile_curves["p90"],
+                                     name="Optimistic (90th pct)",
+                                     line=dict(color="#26a69a", width=1)))
+            fan.add_trace(go.Scatter(x=months, y=g.percentile_curves["p10"],
+                                     name="Pessimistic (10th pct)", fill="tonexty",
+                                     fillcolor="rgba(41,182,246,0.15)",
+                                     line=dict(color="#ef5350", width=1)))
+            fan.add_trace(go.Scatter(x=months, y=g.percentile_curves["p50"],
+                                     name="Median", line=dict(color="#29b6f6", width=2)))
+            fan.add_hline(y=g.target_value, line_dash="dot",
+                          annotation_text=f"target {g.target_value:,.0f}")
+            fan.update_layout(title=f"Monte Carlo outlook — {g.probability:.0%} "
+                                    f"chance of reaching your target",
+                              xaxis_title="Months", yaxis_title="Portfolio value",
+                              height=400, margin=dict(t=50, b=10))
+            st.plotly_chart(fan, use_container_width=True)
+            st.caption(f"After {profile.horizon_years:.0f} years: pessimistic "
+                       f"{g.final_percentiles[10]:,.0f} · median "
+                       f"{g.final_percentiles[50]:,.0f} · optimistic "
+                       f"{g.final_percentiles[90]:,.0f}")
 
         with st.expander("Why these picks?"):
             for r in report.picks:
@@ -398,6 +435,74 @@ with tab_portfolio:
                 manager().remove_dca(d_sym)
                 st.success(f"DCA plan removed for {d_sym}")
                 st.rerun()
+
+    st.divider()
+    st.subheader("🔌 Connect & notifications")
+    c_discord, c_import, c_ibkr = st.columns(3)
+
+    with c_discord:
+        st.markdown("**Discord alerts**")
+        current_url = notify.get_webhook_url(ROOT / "data" / "config.json") or ""
+        hook = st.text_input("Webhook URL", current_url, type="password",
+                             help="Discord → channel → Edit → Integrations → "
+                                  "Webhooks → New Webhook → Copy URL")
+        if st.button("Save webhook") and hook.strip():
+            notify.set_webhook_url(hook, ROOT / "data" / "config.json")
+            st.success("Webhook saved.")
+        cb1, cb2 = st.columns(2)
+        if cb1.button("Send test ping"):
+            ok = notify.send_message("✅ Trading Assistant is connected to "
+                                     "this channel.", hook or None)
+            st.success("Sent!") if ok else st.error("Failed — check the URL.")
+        if cb2.button("Push current alerts"):
+            n = notify.send_alerts(alerts, hook or None,
+                                   state_path=ROOT / "data" / "alert_state.json")
+            st.success(f"Sent {n} alert(s)." if n else
+                       "Nothing new to send (dedupe cooldown or no alerts).")
+        st.caption("For 24/7 alerts run:  `python -m trading_assistant.cli watch`")
+
+    with c_import:
+        st.markdown("**Import positions (CSV)**")
+        st.caption("Works for Trade Republic and any broker without an API. "
+                   "Columns: symbol, quantity, avg_cost (aliases & `;` accepted).")
+        up = st.file_uploader("Positions CSV", type=["csv"])
+        replace_csv = st.checkbox("Mirror file exactly (remove others)", value=False)
+        if up is not None and st.button("Import CSV"):
+            import tempfile
+            from trading_assistant.brokers import import_positions_csv
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+                f.write(up.getvalue())
+                tmp = f.name
+            try:
+                result = import_positions_csv(manager(), tmp, replace=replace_csv)
+                st.success(f"Added {len(result['added'])}, updated "
+                           f"{len(result['updated'])}, removed {len(result['removed'])}.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with c_ibkr:
+        st.markdown("**Interactive Brokers (live sync)**")
+        st.caption("Read-only, via the official API. Requires TWS or IB Gateway "
+                   "running on this machine with socket clients enabled.")
+        ib_host = st.text_input("Host", "127.0.0.1")
+        ib_port = st.number_input("Port", 1, 65535, 7497,
+                                  help="7497 TWS paper · 7496 TWS live · "
+                                       "4002/4001 Gateway")
+        ib_merge = st.checkbox("Merge only (don't remove local positions)", value=False)
+        if st.button("Sync from IBKR"):
+            try:
+                from trading_assistant.brokers import (fetch_ibkr_positions,
+                                                       sync_positions)
+                positions = fetch_ibkr_positions(host=ib_host, port=int(ib_port))
+                result = sync_positions(manager(), positions, replace=not ib_merge)
+                st.success(f"Synced {len(positions)} position(s): "
+                           f"+{len(result['added'])} added, "
+                           f"~{len(result['updated'])} updated, "
+                           f"-{len(result['removed'])} removed.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"IBKR connection failed: {e}")
 
 
 # ====================================================================

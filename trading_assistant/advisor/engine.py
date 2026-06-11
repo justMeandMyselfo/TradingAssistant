@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 from ..analysis.indicators import atr
 from ..analysis.metrics import AssetMetrics, compute_metrics
+from ..analysis.portfolio_risk import (GoalSimulation, portfolio_volatility,
+                                       shrink_return, simulate_goal)
 from ..data.provider import DataProvider
 from .profile import InvestorProfile
 from .universe import UNIVERSE, Asset
@@ -32,12 +34,13 @@ class Recommendation:
 class AdviceReport:
     profile: InvestorProfile
     picks: list[Recommendation]
-    expected_return: float       # weighted CAGR of the picks
-    expected_volatility: float   # naive weighted vol (upper bound, ignores correlation)
+    expected_return: float       # weighted historical CAGR of the picks
+    expected_volatility: float   # correlation-aware portfolio volatility
     target_feasible: bool
     target_comment: str
     data_source: str
     is_live_data: bool
+    goal: GoalSimulation | None = None   # Monte Carlo probability of hitting the target
 
 
 class AdvisorEngine:
@@ -110,6 +113,7 @@ class AdvisorEngine:
 
     def advise(self, profile: InvestorProfile, top_n: int = 8) -> AdviceReport:
         candidates: list[Recommendation] = []
+        closes: dict[str, "pd.Series"] = {}  # noqa: F821 — for covariance/MC
         for asset in UNIVERSE:
             if asset.risk_bucket > profile.max_risk_bucket:
                 continue
@@ -126,19 +130,33 @@ class AdvisorEngine:
             rec = Recommendation(asset=asset, metrics=m, score=score, reasons=reasons)
             self._protective_levels(rec, df)
             candidates.append(rec)
+            closes[asset.symbol] = df["Close"]
 
         candidates.sort(key=lambda r: r.score, reverse=True)
         picks = self._diversify(candidates, top_n)
         self._allocate(picks, profile)
 
         exp_ret = sum(r.weight * r.metrics.annual_return for r in picks)
-        exp_vol = sum(r.weight * r.metrics.annual_volatility for r in picks)
+        weights = {r.asset.symbol: r.weight for r in picks}
+        try:
+            exp_vol = portfolio_volatility(
+                {s: closes[s] for s in weights}, weights)
+        except Exception:  # fallback: naive weighted vol (upper bound)
+            exp_vol = sum(r.weight * r.metrics.annual_volatility for r in picks)
+
+        goal = None
+        if picks and profile.capital > 0:
+            goal = simulate_goal(
+                capital=profile.capital, mu=shrink_return(exp_ret), sigma=exp_vol,
+                horizon_years=profile.horizon_years,
+                target_growth=profile.target_annual_growth)
+
         feasible, comment = profile.is_target_realistic()
         return AdviceReport(profile=profile, picks=picks,
                             expected_return=exp_ret, expected_volatility=exp_vol,
                             target_feasible=feasible, target_comment=comment,
                             data_source=self.provider.name,
-                            is_live_data=self.provider.is_live)
+                            is_live_data=self.provider.is_live, goal=goal)
 
     def _diversify(self, ranked: list[Recommendation], top_n: int) -> list[Recommendation]:
         """Greedy pick by score with caps per sector/asset-class so the
