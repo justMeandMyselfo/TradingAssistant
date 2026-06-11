@@ -98,6 +98,43 @@ def check_alerts(manager: PortfolioManager, provider: DataProvider) -> list[Aler
                                 "actually happened, or is this just volatility?",
                                 price))
 
+    # Event risk: earnings gap-risk on stops, imminent FOMC decisions.
+    from ..events import upcoming_events
+    try:
+        evs = upcoming_events(provider, [p.symbol for p in pf.positions],
+                              within_days=5)
+        for ev in evs:
+            if ev.kind == "earnings":
+                pos = next((p for p in pf.positions if p.symbol == ev.symbol), None)
+                if pos is None:
+                    continue
+                price = prices.get(ev.symbol)
+                r = pos.rules
+                stop = r.stop_loss
+                if stop is None and r.trailing_stop_pct and r.high_water_mark:
+                    stop = r.high_water_mark * (1 - r.trailing_stop_pct)
+                when = f"in {ev.days_away}d ({ev.date})"
+                if stop and price and price > stop:
+                    gap = (price - stop) / price
+                    alerts.append(Alert(ev.symbol, "event_risk", AlertLevel.WARNING,
+                                        f"{ev.symbol} reports earnings {when} and "
+                                        f"your stop sits {gap:.1%} below price — "
+                                        "an earnings gap can blow straight through "
+                                        "it. Consider widening, hedging, or sizing "
+                                        "down before the print.", price or 0.0))
+                else:
+                    alerts.append(Alert(ev.symbol, "event_risk", AlertLevel.INFO,
+                                        f"{ev.symbol} reports earnings {when} — "
+                                        "expect elevated volatility.",
+                                        price or 0.0))
+            elif ev.kind == "fomc" and pf.positions and ev.days_away <= 3:
+                alerts.append(Alert("MACRO", "event_risk", AlertLevel.INFO,
+                                    f"FOMC rate decision in {ev.days_away}d "
+                                    f"({ev.date}) — market-wide volatility likely.",
+                                    0.0))
+    except Exception:
+        pass
+
     for plan in pf.dca_plans:
         if plan.is_due():
             alerts.append(Alert(plan.symbol, "dca_due", AlertLevel.INFO,

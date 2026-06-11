@@ -20,7 +20,8 @@ from trading_assistant.advisor.universe import UNIVERSE                       # 
 from trading_assistant.analysis.indicators import bollinger, ema, macd, rsi, sma  # noqa: E402
 from trading_assistant.backtest import backtest_dca, backtest_lump_sum        # noqa: E402
 from trading_assistant.data import get_provider                               # noqa: E402
-from trading_assistant import guardrails, notify, tax                         # noqa: E402
+from trading_assistant import guardrails, notify, tax, tracking               # noqa: E402
+from trading_assistant.events import upcoming_events                          # noqa: E402
 from trading_assistant.portfolio import PortfolioManager, check_alerts       # noqa: E402
 from trading_assistant.portfolio.manager import SellLockedError              # noqa: E402
 
@@ -63,8 +64,9 @@ else:
                "**deterministic simulated data**. All features work identically; "
                "reconnect to the internet for real prices.", icon="⚠️")
 
-tab_market, tab_advisor, tab_portfolio, tab_tax, tab_backtest = st.tabs(
-    ["📊 Market", "🎯 Advisor", "💼 Portfolio", "🧾 Tax", "🧪 Backtest"])
+tab_market, tab_advisor, tab_portfolio, tab_tax, tab_track, tab_backtest = st.tabs(
+    ["📊 Market", "🎯 Advisor", "💼 Portfolio", "🧾 Tax", "📋 Track record",
+     "🧪 Backtest"])
 
 
 # ---------- price chart helper ----------
@@ -182,7 +184,10 @@ with tab_advisor:
                                   max_position_pct=max_pos, include_crypto=include_crypto,
                                   preferred_sectors=prefer, excluded_sectors=exclude)
         with st.spinner("Analyzing the market…"):
-            st.session_state["advice"] = AdvisorEngine(provider()).advise(profile, top_n=top_n)
+            report_new = AdvisorEngine(provider()).advise(profile, top_n=top_n)
+            st.session_state["advice"] = report_new
+            tracking.log_report(report_new, provider(),
+                                path=ROOT / "data" / "advice_log.json")
 
     report = st.session_state.get("advice")
     if report:
@@ -338,6 +343,18 @@ with tab_portfolio:
                 else:
                     st.info(line)
 
+    try:
+        evs = upcoming_events(provider(),
+                              [p_.symbol for p_ in mgr.portfolio.positions],
+                              within_days=14)
+    except Exception:
+        evs = []
+    if evs:
+        with st.expander(f"📅 Upcoming events affecting your portfolio ({len(evs)})"):
+            for ev in evs:
+                who = ev.symbol or "MACRO"
+                st.write(f"**{ev.date}** ({ev.days_away}d) · {who} — {ev.note}")
+
     v = mgr.valuation(provider())
     if v["rows"]:
         t1, t2, t3 = st.columns(3)
@@ -477,7 +494,7 @@ with tab_portfolio:
 
     st.divider()
     st.subheader("🔌 Connect & notifications")
-    c_discord, c_import, c_ibkr = st.columns(3)
+    c_discord, c_import, c_ibkr, c_alpaca = st.columns(4)
 
     with c_discord:
         st.markdown("**Discord alerts**")
@@ -542,6 +559,36 @@ with tab_portfolio:
                 st.rerun()
             except Exception as e:
                 st.error(f"IBKR connection failed: {e}")
+
+    with c_alpaca:
+        st.markdown("**Alpaca execution (paper)**")
+        st.caption("Turns triggered alerts into real orders on Alpaca's paper "
+                   "endpoint. Keys are stored locally, git-ignored.")
+        a_key = st.text_input("API key ID", type="password")
+        a_secret = st.text_input("API secret", type="password")
+        if st.button("Save Alpaca keys") and a_key and a_secret:
+            cfg = notify.load_config()
+            cfg["alpaca_key"] = a_key
+            cfg["alpaca_secret"] = a_secret
+            notify.save_config(cfg)
+            st.success("Saved.")
+        from trading_assistant.brokers import alpaca as alpaca_mod
+        plans = alpaca_mod.plan_orders(mgr, alerts)
+        if plans:
+            st.write("**Order plan from current alerts:**")
+            for pl in plans:
+                st.write(f"• {pl.describe()}")
+            if st.button(f"▶ Submit {len(plans)} order(s) to PAPER"):
+                try:
+                    client = alpaca_mod.from_config(paper=True)
+                    executed = alpaca_mod.execute_plan(client, manager(), plans,
+                                                       provider=provider())
+                    st.success(f"Submitted {len(executed)} order(s).")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+        else:
+            st.caption("✓ No triggered alerts require orders right now.")
 
 
 # ====================================================================
@@ -636,7 +683,53 @@ with tab_tax:
 
 
 # ====================================================================
-# TAB 5 — BACKTEST
+# TAB 5 — TRACK RECORD
+# ====================================================================
+
+with tab_track:
+    st.caption("Every recommendation the Advisor makes is logged with its "
+               "prices at the time, then marked to market against simply "
+               "buying SPY. If the engine can't beat the boring benchmark, "
+               "you deserve to know.")
+    try:
+        perfs = tracking.performance(provider(),
+                                     path=ROOT / "data" / "advice_log.json")
+    except Exception:
+        perfs = []
+    if perfs:
+        s = tracking.summary(perfs)
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Recommendations tracked", s["count"])
+        k2.metric("Beat SPY", f"{s['beat_rate']:.0%} of the time")
+        k3.metric("Average alpha", f"{s['avg_alpha']:+.2%}")
+
+        track_df = pd.DataFrame([{
+            "ID": t.entry_id, "Date": t.date, "Profile": t.label,
+            "Picks": t.n_picks, "Capital": t.capital,
+            "Return": t.portfolio_return, "SPY": t.benchmark_return,
+            "Alpha": t.alpha} for t in perfs])
+        st.dataframe(track_df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Return": st.column_config.NumberColumn(format="percent"),
+                         "SPY": st.column_config.NumberColumn(format="percent"),
+                         "Alpha": st.column_config.NumberColumn(format="percent"),
+                         "Capital": st.column_config.NumberColumn(format="dollar"),
+                     })
+        bar = go.Figure(go.Bar(
+            x=[f"{t.date} ({t.entry_id})" for t in perfs],
+            y=[t.alpha * 100 for t in perfs],
+            marker_color=["#26a69a" if t.alpha >= 0 else "#ef5350" for t in perfs]))
+        bar.update_layout(title="Alpha vs SPY per recommendation",
+                          yaxis_title="Alpha (%)", height=380,
+                          margin=dict(t=50, b=10))
+        st.plotly_chart(bar, use_container_width=True)
+    else:
+        st.info("No tracked recommendations yet — generate one in the Advisor "
+                "tab and it will be logged automatically.")
+
+
+# ====================================================================
+# TAB 6 — BACKTEST
 # ====================================================================
 
 with tab_backtest:

@@ -40,6 +40,17 @@ A full-featured investment advisor and portfolio tracker:
   consciously); a **pre-commitment journal** stores your thesis and exit
   condition per position and confronts you with them during drawdowns; a
   **panic-cost simulator** shows what selling at past dips would have cost.
+- **📅 Event awareness** — upcoming earnings dates and the FOMC calendar feed
+  the alert engine: a stop sitting close to price days before earnings gets a
+  gap-risk warning (an earnings gap can fill far below a stop-market order).
+- **⚡ Alpaca execution** — triggered alerts become real orders: stop-loss →
+  market sell (or limit sell at your stop-limit), take-profit → sell, due DCA
+  → notional buy. **Paper trading by default**; the live endpoint requires an
+  explicit double opt-in. Every run shows a dry-run plan first.
+- **📋 Accountability dashboard** — every advisor recommendation is logged
+  with its prices and continuously marked to market against just buying SPY:
+  per-recommendation alpha, beat rate, and average alpha. If the engine can't
+  beat the boring benchmark, you'll see it.
 
 ## Data
 
@@ -89,6 +100,15 @@ python -m trading_assistant.cli tax rates --short 30 --long 15
 python -m trading_assistant.cli journal set AAPL --thesis "..." --sell-if "..."
 python -m trading_assistant.cli breaker status        # circuit breaker state
 python -m trading_assistant.cli sell AAPL 5 200 --override   # conscious bypass
+
+# Events, execution, accountability
+python -m trading_assistant.cli events --days 14      # earnings + FOMC calendar
+python -m trading_assistant.cli config alpaca KEY SECRET
+python -m trading_assistant.cli alpaca status         # paper account state
+python -m trading_assistant.cli alpaca execute        # dry-run order plan
+python -m trading_assistant.cli alpaca execute --send # submit to PAPER
+python -m trading_assistant.cli watch --execute       # 24/7: alert → paper order
+python -m trading_assistant.cli track                 # advisor picks vs SPY
 ```
 
 ## Broker notes
@@ -113,10 +133,12 @@ trading_assistant/
   analysis/    # indicators, risk metrics, covariance vol + Monte Carlo goals
   advisor/     # investor profile, asset universe, scoring/allocation engine
   portfolio/   # positions, protective rules, DCA plans, persistence, alerts
-  brokers/     # IBKR live sync (official API) + generic CSV import
+  brokers/     # IBKR live sync, Alpaca execution, generic CSV import
   notify.py    # Discord webhook alerts with de-duplication
   tax.py       # tax lots, loss harvesting, wash sales, realized gains
   guardrails.py # circuit breaker, panic-cost simulator
+  events.py    # earnings dates + FOMC calendar for event-risk alerts
+  tracking.py  # accountability log: advisor picks vs SPY
   backtest.py  # DCA vs lump-sum backtests
   cli.py       # command-line interface
 app/

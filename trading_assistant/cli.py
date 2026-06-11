@@ -51,6 +51,10 @@ def cmd_advise(args) -> None:
         excluded_sectors=args.exclude or [],
         preferred_sectors=args.prefer or [])
     report = AdvisorEngine(p).advise(profile, top_n=args.top)
+    if not args.no_track:
+        from .tracking import log_report
+        entry_id = log_report(report, p)
+        print(f"(recommendation logged as {entry_id} — see `track` for performance)")
 
     print(f"\nProfile: {profile.label} (risk {profile.risk_tolerance}/10), "
           f"target {profile.target_annual_growth:.0%}/yr, "
@@ -192,6 +196,13 @@ def cmd_watch(args) -> None:
                 sent = send_alerts(alerts)
                 if sent:
                     print(f"→ {sent} alert(s) sent to Discord.")
+            if args.execute:
+                from .brokers import alpaca
+                plans = alpaca.plan_orders(mgr, alerts)
+                if plans:
+                    client = alpaca.from_config(paper=True)  # watch = paper only
+                    for pl in alpaca.execute_plan(client, mgr, plans, provider=p):
+                        print(f"→ submitted {pl.describe()}")
         else:
             print("✓ no alerts")
         if args.once:
@@ -203,6 +214,17 @@ def cmd_config(args) -> None:
     if args.key == "discord":
         set_webhook_url(args.value)
         print("Discord webhook saved to data/config.json")
+    elif args.key == "alpaca":
+        if not args.secret:
+            print("Usage: config alpaca <key-id> <secret>")
+            return
+        from .notify import load_config, save_config
+        cfg = load_config()
+        cfg["alpaca_key"] = args.value
+        cfg["alpaca_secret"] = args.secret
+        save_config(cfg)
+        print("Alpaca keys saved to data/config.json (git-ignored). "
+              "Paper trading is the default endpoint.")
 
 
 def cmd_notify(args) -> None:
@@ -308,6 +330,73 @@ def cmd_breaker(args) -> None:
         print("Circuit breaker released.")
 
 
+def cmd_track(args) -> None:
+    from .tracking import performance, summary
+    p = _provider(args)
+    perfs = performance(p)
+    if not perfs:
+        print("No tracked recommendations yet — run `advise` first.")
+        return
+    hdr = f"{'ID':>10} {'DATE':>12} {'PROFILE':>16} {'PICKS':>6} {'RETURN':>9} {'SPY':>9} {'ALPHA':>9}"
+    print(hdr)
+    print("-" * len(hdr))
+    for t in perfs:
+        print(f"{t.entry_id:>10} {t.date:>12} {t.label:>16} {t.n_picks:>6} "
+              f"{t.portfolio_return:>+8.2%} {t.benchmark_return:>+8.2%} "
+              f"{t.alpha:>+8.2%}")
+    s = summary(perfs)
+    print("-" * len(hdr))
+    print(f"{s['count']} recommendation(s) tracked — beat SPY {s['beat_rate']:.0%} "
+          f"of the time, average alpha {s['avg_alpha']:+.2%}")
+
+
+def cmd_events(args) -> None:
+    from .events import upcoming_events
+    mgr = PortfolioManager()
+    p = _provider(args)
+    symbols = [pos.symbol for pos in mgr.portfolio.positions] + (args.symbols or [])
+    evs = upcoming_events(p, symbols, within_days=args.days)
+    if not evs:
+        print(f"No earnings/macro events within {args.days} days.")
+        return
+    for ev in evs:
+        who = ev.symbol or "MACRO"
+        print(f"{ev.date}  ({ev.days_away:>2}d)  {who:>8}  {ev.note}")
+
+
+def cmd_alpaca(args) -> None:
+    from .brokers import alpaca
+    if args.action == "status":
+        client = alpaca.from_config(paper=not args.live)
+        acct = client.account()
+        mode = "PAPER" if client.paper else "LIVE"
+        print(f"[{mode}] account {acct.get('account_number', '?')}: "
+              f"equity {float(acct.get('equity', 0)):,.2f}, "
+              f"cash {float(acct.get('cash', 0)):,.2f}, "
+              f"status {acct.get('status', '?')}")
+        return
+    # execute
+    mgr = PortfolioManager()
+    p = _provider(args)
+    alerts = check_alerts(mgr, p)
+    plans = alpaca.plan_orders(mgr, alerts)
+    if not plans:
+        print("✓ No triggered alerts require orders.")
+        return
+    print("Order plan:")
+    for pl in plans:
+        print(f"  • {pl.describe()}")
+    if not args.send:
+        print("\nDry run (default). Re-run with --send to submit"
+              f"{' to PAPER' if not args.live else ' to LIVE'}.")
+        return
+    client = alpaca.from_config(paper=not args.live)
+    executed = alpaca.execute_plan(client, mgr, plans, provider=p)
+    for pl in executed:
+        print(f"  ✓ submitted {pl.side} {pl.symbol} "
+              f"(order id {pl.result.get('id', '?')})")
+
+
 def cmd_import_csv(args) -> None:
     from .brokers import import_positions_csv
     result = import_positions_csv(PortfolioManager(), args.path,
@@ -348,6 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--crypto", action="store_true", help="allow crypto assets")
     a.add_argument("--exclude", nargs="*", help="sectors to exclude")
     a.add_argument("--prefer", nargs="*", help="sectors to favor")
+    a.add_argument("--no-track", action="store_true",
+                   help="don't log this recommendation for accountability tracking")
     a.set_defaults(func=cmd_advise)
 
     b = sub.add_parser("buy", help="record a purchase (creates a tax lot)")
@@ -413,12 +504,33 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--interval", type=int, default=300, help="seconds between checks")
     w.add_argument("--notify", action="store_true", default=True)
     w.add_argument("--once", action="store_true", help="single check then exit")
+    w.add_argument("--execute", action="store_true",
+                   help="auto-submit triggered orders to Alpaca PAPER")
     w.set_defaults(func=cmd_watch)
 
-    cf = sub.add_parser("config", help="store settings (e.g. Discord webhook)")
-    cf.add_argument("key", choices=["discord"])
-    cf.add_argument("value")
+    cf = sub.add_parser("config", help="store settings (Discord webhook, Alpaca keys)")
+    cf.add_argument("key", choices=["discord", "alpaca"])
+    cf.add_argument("value", help="webhook URL, or Alpaca key id")
+    cf.add_argument("secret", nargs="?", default=None,
+                    help="Alpaca secret (with key 'alpaca')")
     cf.set_defaults(func=cmd_config)
+
+    tr = sub.add_parser("track", help="advisor accountability: picks vs SPY")
+    tr.set_defaults(func=cmd_track)
+
+    ev = sub.add_parser("events", help="upcoming earnings & macro events")
+    ev.add_argument("symbols", nargs="*", help="extra symbols beyond the portfolio")
+    ev.add_argument("--days", type=int, default=14)
+    ev.set_defaults(func=cmd_events)
+
+    ax = sub.add_parser("alpaca", help="paper-trading execution via Alpaca")
+    ax.add_argument("action", choices=["status", "execute"])
+    ax.add_argument("--send", action="store_true",
+                    help="actually submit orders (default: dry-run plan)")
+    ax.add_argument("--live", action="store_true",
+                    help="use the LIVE endpoint (also needs alpaca_allow_live "
+                         "in config)")
+    ax.set_defaults(func=cmd_alpaca)
 
     no = sub.add_parser("notify", help="notification utilities")
     no.add_argument("action", choices=["test"])
