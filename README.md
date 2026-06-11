@@ -28,7 +28,18 @@ A full-featured investment advisor and portfolio tracker:
 - **🏦 Broker connectivity** — read-only live position sync from **Interactive
   Brokers** (official API via TWS/IB Gateway), plus a flexible **CSV import**
   (handles Trade Republic-style exports, `;` separators, European decimal
-  commas, column aliases). Protective rules survive every sync.
+  commas, column aliases). Protective rules and tax lots survive every sync.
+- **🧾 Tax-lot accounting** — every buy is a tax lot; sells consume lots FIFO
+  and split realized gains into short/long-term. **Tax-loss harvesting**
+  suggestions per lot with estimated savings, similar-asset replacements to
+  stay invested, **wash-sale detection** (recent buys *and* active DCA plans),
+  "this lot turns long-term in N days" warnings before sells, and a realized
+  year-to-date summary. Rates are configurable per jurisdiction.
+- **🧠 Behavioral guardrails** — a **circuit breaker** soft-locks sells for a
+  cooling-off period when the portfolio drops hard in a week (overridable,
+  consciously); a **pre-commitment journal** stores your thesis and exit
+  condition per position and confronts you with them during drawdowns; a
+  **panic-cost simulator** shows what selling at past dips would have cost.
 
 ## Data
 
@@ -67,7 +78,17 @@ python -m trading_assistant.cli watch --interval 300   # 24/7 monitor
 
 # Broker sync
 python -m trading_assistant.cli sync ibkr --port 7497   # TWS paper account
-python -m trading_assistant.cli import-csv my_positions.csv   # Trade Republic & co.
+python -m trading_assistant.cli import-csv my_positions.csv   # API-less brokers
+
+# Tax & guardrails
+python -m trading_assistant.cli buy AAPL 10 182.50 --thesis "moat" --sell-if "services shrink"
+python -m trading_assistant.cli lots                  # tax lots + journal per position
+python -m trading_assistant.cli tax harvest           # loss-harvesting suggestions
+python -m trading_assistant.cli tax summary           # realized ST/LT gains YTD
+python -m trading_assistant.cli tax rates --short 30 --long 15
+python -m trading_assistant.cli journal set AAPL --thesis "..." --sell-if "..."
+python -m trading_assistant.cli breaker status        # circuit breaker state
+python -m trading_assistant.cli sell AAPL 5 200 --override   # conscious bypass
 ```
 
 ## Broker notes
@@ -94,6 +115,8 @@ trading_assistant/
   portfolio/   # positions, protective rules, DCA plans, persistence, alerts
   brokers/     # IBKR live sync (official API) + generic CSV import
   notify.py    # Discord webhook alerts with de-duplication
+  tax.py       # tax lots, loss harvesting, wash sales, realized gains
+  guardrails.py # circuit breaker, panic-cost simulator
   backtest.py  # DCA vs lump-sum backtests
   cli.py       # command-line interface
 app/

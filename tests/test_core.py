@@ -103,8 +103,8 @@ def test_buy_sell_avg_cost(manager):
     pos = manager.get_position("aapl")
     assert pos.quantity == 20
     assert pos.avg_cost == pytest.approx(150)
-    realized = manager.sell("AAPL", 5, 180)
-    assert realized == pytest.approx(150)
+    sale = manager.sell("AAPL", 5, 180)
+    assert sale.total == pytest.approx(400)  # FIFO: first lot cost 100, not avg 150
     assert manager.get_position("AAPL").quantity == 15
     with pytest.raises(ValueError):
         manager.sell("AAPL", 999, 100)

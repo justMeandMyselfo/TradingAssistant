@@ -20,8 +20,9 @@ from trading_assistant.advisor.universe import UNIVERSE                       # 
 from trading_assistant.analysis.indicators import bollinger, ema, macd, rsi, sma  # noqa: E402
 from trading_assistant.backtest import backtest_dca, backtest_lump_sum        # noqa: E402
 from trading_assistant.data import get_provider                               # noqa: E402
-from trading_assistant import notify                                          # noqa: E402
+from trading_assistant import guardrails, notify, tax                         # noqa: E402
 from trading_assistant.portfolio import PortfolioManager, check_alerts       # noqa: E402
+from trading_assistant.portfolio.manager import SellLockedError              # noqa: E402
 
 st.set_page_config(page_title="Trading Assistant", page_icon="📈", layout="wide")
 
@@ -62,8 +63,8 @@ else:
                "**deterministic simulated data**. All features work identically; "
                "reconnect to the internet for real prices.", icon="⚠️")
 
-tab_market, tab_advisor, tab_portfolio, tab_backtest = st.tabs(
-    ["📊 Market", "🎯 Advisor", "💼 Portfolio", "🧪 Backtest"])
+tab_market, tab_advisor, tab_portfolio, tab_tax, tab_backtest = st.tabs(
+    ["📊 Market", "🎯 Advisor", "💼 Portfolio", "🧾 Tax", "🧪 Backtest"])
 
 
 # ---------- price chart helper ----------
@@ -311,6 +312,19 @@ with tab_advisor:
 with tab_portfolio:
     mgr = manager()
     alerts = check_alerts(mgr, provider())
+
+    g = mgr.portfolio.guardrail
+    if g.is_locked():
+        st.error(f"🔒 **Behavioral circuit breaker engaged** until {g.locked_until} "
+                 f"UTC — {g.reason}")
+        with st.expander("Your own theses (read before overriding)"):
+            for p_ in mgr.portfolio.positions:
+                st.markdown(f"**{p_.symbol}** — thesis: "
+                            f"*{p_.thesis or 'none written'}* · sell if: "
+                            f"*{p_.invalidation or 'none written'}*")
+        if st.button("I've re-read my theses — release the circuit breaker"):
+            guardrails.release_circuit_breaker(manager())
+            st.rerun()
     if alerts:
         icons = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
         with st.container(border=True):
@@ -371,18 +385,43 @@ with tab_portfolio:
             t_qty = st.number_input("Quantity", 0.0001, 1e9, 10.0, format="%.4f")
             use_live = st.checkbox("Use current market price", value=True)
             t_price = st.number_input("Price (if not using market)", 0.01, 1e9, 100.0)
+            t_thesis = st.text_input("Thesis (why are you buying?)", "",
+                                     help="Buys only. Future-you will thank you "
+                                          "during the next drawdown.")
+            t_sell_if = st.text_input("Sell if… (your exit condition)", "")
+            t_override = st.checkbox("Override circuit breaker (sells)", value=False)
             if st.form_submit_button("Save trade"):
                 try:
                     px = provider().quote(t_sym).price if use_live else t_price
                     if side == "Buy":
-                        pos = manager().buy(t_sym, t_qty, px)
+                        pos = manager().buy(t_sym, t_qty, px, thesis=t_thesis,
+                                            invalidation=t_sell_if)
                         st.success(f"Bought {t_qty} {t_sym} @ {px:,.2f} "
                                    f"(avg cost {pos.avg_cost:,.2f})")
                     else:
-                        realized = manager().sell(t_sym, t_qty, px)
-                        st.success(f"Sold {t_qty} {t_sym} @ {px:,.2f} — "
-                                   f"realized {realized:+,.2f}")
+                        check = tax.preview_sale(manager(), t_sym, t_qty, px)
+                        for lot_date, days_left, gain in check.almost_long_term:
+                            st.warning(f"Lot {lot_date} turns long-term in "
+                                       f"{days_left}d — waiting taxes its "
+                                       f"{gain:+,.2f} gain at the lower rate.")
+                        sale = manager().sell(t_sym, t_qty, px, override=t_override)
+                        st.success(f"Sold {t_qty} {t_sym} @ {px:,.2f} — realized "
+                                   f"{sale.total:+,.2f} (ST {sale.short_term:+,.2f} / "
+                                   f"LT {sale.long_term:+,.2f})")
                     st.rerun()
+                except SellLockedError as e:
+                    st.error(f"🔒 {e}")
+                    try:
+                        dips = guardrails.panic_cost(
+                            cached_history(t_sym, "2y")["Close"])
+                        if dips:
+                            st.info("Reality check — selling at past dips of "
+                                    f"{t_sym} would have cost you: " +
+                                    "; ".join(f"{d.trough_date} ({d.drawdown:.0%} "
+                                              f"low → {d.recovery_return:+.0%} since)"
+                                              for d in dips))
+                    except Exception:
+                        pass
                 except Exception as e:
                     st.error(str(e))
 
@@ -506,7 +545,98 @@ with tab_portfolio:
 
 
 # ====================================================================
-# TAB 4 — BACKTEST
+# TAB 4 — TAX
+# ====================================================================
+
+with tab_tax:
+    mgr_tax = manager()
+    st.caption("Bookkeeping support, not tax advice — rates and wash-sale rules "
+               "depend on your country; configure them below.")
+
+    short_rate, long_rate = tax.tax_rates()
+    cset1, cset2, cset3 = st.columns(3)
+    new_short = cset1.number_input("Short-term rate %", 0.0, 60.0, short_rate * 100, 1.0)
+    new_long = cset2.number_input("Long-term rate %", 0.0, 60.0, long_rate * 100, 1.0)
+    with cset3:
+        st.write("")
+        if st.button("Save rates"):
+            cfg = notify.load_config()
+            cfg["tax_short_rate"] = new_short / 100
+            cfg["tax_long_rate"] = new_long / 100
+            notify.save_config(cfg)
+            st.success("Saved.")
+
+    summary = tax.realized_summary(mgr_tax)
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric(f"Realized {summary['year']} (total)", f"{summary['total']:+,.2f}")
+    s2.metric("Short-term", f"{summary['short_term']:+,.2f}")
+    s3.metric("Long-term", f"{summary['long_term']:+,.2f}")
+    s4.metric("Estimated tax owed", f"{summary['est_tax']:,.2f}")
+
+    st.subheader("🌾 Tax-loss harvesting opportunities")
+    try:
+        suggestions = tax.harvest_opportunities(mgr_tax, provider())
+    except Exception:
+        suggestions = []
+    if suggestions:
+        for s in suggestions:
+            term = "long-term" if s.is_long_term else "short-term"
+            with st.container(border=True):
+                st.markdown(
+                    f"**{s.symbol}** lot {s.lot_date}: {s.quantity:,.4f} @ "
+                    f"{s.cost_per_share:,.2f} → now {s.current_price:,.2f} — loss "
+                    f"**{s.unrealized_loss:,.2f}** ({s.loss_pct:.1%}, {term})")
+                st.markdown(f"💰 Estimated tax saving if harvested: "
+                            f"**≈{s.est_tax_saving:,.2f}**" +
+                            (f" · stay invested via **{', '.join(s.replacements)}**"
+                             if s.replacements else ""))
+                for w in s.warnings:
+                    st.warning(w)
+    else:
+        st.info("No harvestable losses above thresholds (5% or 100 in currency, per lot).")
+
+    st.subheader("📋 Tax lots")
+    if mgr_tax.portfolio.positions:
+        lot_rows = []
+        for pos in mgr_tax.portfolio.positions:
+            try:
+                px = provider().quote(pos.symbol).price
+            except Exception:
+                px = pos.avg_cost
+            for lot in pos.lots:
+                lot_rows.append({
+                    "Symbol": pos.symbol, "Purchased": lot.date,
+                    "Quantity": lot.quantity, "Cost/share": lot.cost_per_share,
+                    "Price": px,
+                    "Unrealized": (px - lot.cost_per_share) * lot.quantity,
+                    "Term": "Long" if lot.is_long_term()
+                            else f"Short ({lot.days_to_long_term()}d to long)",
+                })
+        st.dataframe(pd.DataFrame(lot_rows), use_container_width=True, hide_index=True,
+                     column_config={
+                         "Cost/share": st.column_config.NumberColumn(format="dollar"),
+                         "Price": st.column_config.NumberColumn(format="dollar"),
+                         "Unrealized": st.column_config.NumberColumn(format="dollar"),
+                     })
+    else:
+        st.info("No positions yet.")
+
+    st.subheader("✍️ Pre-commitment journal")
+    if mgr_tax.portfolio.positions:
+        j_sym = st.selectbox("Position", [p_.symbol for p_ in mgr_tax.portfolio.positions],
+                             key="journal_sym")
+        j_pos = mgr_tax.get_position(j_sym)
+        with st.form("journal_form"):
+            j_thesis = st.text_area("Thesis — why do you own this?", j_pos.thesis)
+            j_invalid = st.text_area("Sell if… — what would prove you wrong?",
+                                     j_pos.invalidation)
+            if st.form_submit_button("Save journal"):
+                manager().set_thesis(j_sym, thesis=j_thesis, invalidation=j_invalid)
+                st.success("Saved. This is what the circuit breaker will show you.")
+
+
+# ====================================================================
+# TAB 5 — BACKTEST
 # ====================================================================
 
 with tab_backtest:

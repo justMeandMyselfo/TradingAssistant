@@ -71,6 +71,40 @@ def fetch_ibkr_positions(host: str = "127.0.0.1", port: int = 7497,
             ib.disconnect()
 
 
+def _reconcile_lots(pos, bp: BrokerPosition) -> None:
+    """Adjust local tax lots to match the broker's quantity/avg cost while
+    keeping purchase dates: quantity increases become a new lot at the
+    implied price, decreases consume lots FIFO, and any residual avg-cost
+    drift is fixed by proportionally rescaling lot costs."""
+    from datetime import date
+
+    delta = bp.quantity - pos.quantity
+    if delta > 1e-9:
+        implied = (bp.quantity * bp.avg_cost - pos.quantity * pos.avg_cost) / delta
+        if implied <= 0:
+            implied = bp.avg_cost
+        from ..portfolio.models import TaxLot
+        pos.lots.append(TaxLot(date=date.today().isoformat(),
+                               quantity=delta, cost_per_share=implied))
+    elif delta < -1e-9:
+        remaining = -delta
+        for lot in list(pos.lots):           # FIFO, mirrors a broker-side sale
+            take = min(lot.quantity, remaining)
+            lot.quantity -= take
+            remaining -= take
+            if lot.quantity <= 1e-12:
+                pos.lots.remove(lot)
+            if remaining <= 1e-12:
+                break
+    pos.recompute_from_lots()
+    if pos.quantity > 0 and pos.avg_cost > 0 and \
+            abs(pos.avg_cost - bp.avg_cost) / bp.avg_cost > 0.01:
+        scale = bp.avg_cost / pos.avg_cost
+        for lot in pos.lots:
+            lot.cost_per_share *= scale
+        pos.recompute_from_lots()
+
+
 def sync_positions(manager, positions: list[BrokerPosition],
                    replace: bool = True) -> dict:
     """Write broker positions into the local portfolio.
@@ -95,8 +129,7 @@ def sync_positions(manager, positions: list[BrokerPosition],
     for sym, bp in incoming.items():
         pos = manager.get_position(sym)
         if pos:
-            pos.quantity = bp.quantity
-            pos.avg_cost = bp.avg_cost
+            _reconcile_lots(pos, bp)
             updated.append(sym)
         else:
             pos = Position(symbol=sym, quantity=bp.quantity, avg_cost=bp.avg_cost)

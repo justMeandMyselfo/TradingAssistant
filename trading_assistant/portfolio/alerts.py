@@ -29,10 +29,28 @@ def check_alerts(manager: PortfolioManager, provider: DataProvider) -> list[Aler
     pf = manager.portfolio
     dirty = False
 
+    # Fetch prices once; reused by rules, guardrails and tax checks.
+    prices: dict[str, float] = {}
     for pos in pf.positions:
         try:
-            price = provider.quote(pos.symbol).price
+            prices[pos.symbol] = provider.quote(pos.symbol).price
         except Exception:
+            continue
+
+    # Behavioral circuit breaker: snapshot today's value, engage on fast drops.
+    from .. import guardrails
+    if prices:
+        total_value = pf.cash + sum(p.market_value(prices.get(p.symbol, p.avg_cost))
+                                    for p in pf.positions)
+        guardrails.record_snapshot(manager, total_value)
+        cb_msg = guardrails.check_circuit_breaker(manager)
+        if cb_msg:
+            alerts.append(Alert("PORTFOLIO", "circuit_breaker", AlertLevel.CRITICAL,
+                                cb_msg, total_value))
+
+    for pos in pf.positions:
+        price = prices.get(pos.symbol)
+        if price is None:
             continue
         r = pos.rules
 
@@ -72,11 +90,33 @@ def check_alerts(manager: PortfolioManager, provider: DataProvider) -> list[Aler
                                 f"{pos.symbol} is down {loss_pct:.1f}% with no stop "
                                 "in place — consider adding one.", price))
 
+        # Pre-commitment journal: remind the investor of their own exit rule.
+        if loss_pct < -10 and pos.invalidation:
+            alerts.append(Alert(pos.symbol, "thesis_check", AlertLevel.WARNING,
+                                f"{pos.symbol} is down {loss_pct:.1f}%. Your own "
+                                f"sell condition was: “{pos.invalidation}”. Has it "
+                                "actually happened, or is this just volatility?",
+                                price))
+
     for plan in pf.dca_plans:
         if plan.is_due():
             alerts.append(Alert(plan.symbol, "dca_due", AlertLevel.INFO,
                                 f"DCA due: invest {plan.amount:.2f} in {plan.symbol} "
                                 f"({plan.frequency} plan).", 0.0))
+
+    # Tax-loss harvesting opportunities (top 3 to keep the noise down).
+    from ..tax import harvest_opportunities
+    try:
+        for s in harvest_opportunities(manager, provider, prices=prices)[:3]:
+            wash = f" ⚠ {s.warnings[0]}" if s.warnings else ""
+            alts = f" Stay invested via {', '.join(s.replacements)}." if s.replacements else ""
+            alerts.append(Alert(s.symbol, "tax_harvest", AlertLevel.INFO,
+                                f"Harvestable loss on {s.symbol} lot {s.lot_date}: "
+                                f"{s.unrealized_loss:,.2f} ({s.loss_pct:.1%}) — "
+                                f"≈{s.est_tax_saving:,.2f} in tax savings.{alts}{wash}",
+                                s.current_price))
+    except Exception:
+        pass
 
     if dirty:
         manager.save()

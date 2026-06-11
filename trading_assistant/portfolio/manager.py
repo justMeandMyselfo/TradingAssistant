@@ -1,15 +1,25 @@
-"""Portfolio persistence and operations (buy/sell, rules, DCA, valuation)."""
+"""Portfolio persistence and operations (buy/sell, rules, DCA, valuation).
+
+Sells consume tax lots FIFO and split realized gains into short-term vs
+long-term. A behavioral circuit breaker (see guardrails.py) can soft-lock
+sells for a cooling-off period; pass override=True to bypass it explicitly.
+"""
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from ..data.provider import DataProvider
-from .models import DCAPlan, Portfolio, Position, ProtectionRules
+from .models import (DCAPlan, Portfolio, Position, ProtectionRules,
+                     RealizedSale, TaxLot, TradeRecord)
 
 DEFAULT_PATH = Path("data") / "portfolio.json"
+
+
+class SellLockedError(RuntimeError):
+    """Raised when the behavioral circuit breaker is blocking sells."""
 
 
 class PortfolioManager:
@@ -35,35 +45,81 @@ class PortfolioManager:
         symbol = symbol.upper()
         return next((p for p in self.portfolio.positions if p.symbol == symbol), None)
 
-    def buy(self, symbol: str, quantity: float, price: float) -> Position:
+    def buy(self, symbol: str, quantity: float, price: float,
+            thesis: str = "", invalidation: str = "",
+            trade_date: Optional[str] = None) -> Position:
         if quantity <= 0 or price <= 0:
             raise ValueError("quantity and price must be positive")
         symbol = symbol.upper()
+        trade_date = trade_date or date.today().isoformat()
         pos = self.get_position(symbol)
         if pos:
-            total_cost = pos.cost_basis + quantity * price
-            pos.quantity += quantity
-            pos.avg_cost = total_cost / pos.quantity
+            pos.lots.append(TaxLot(date=trade_date, quantity=quantity,
+                                   cost_per_share=price))
+            pos.recompute_from_lots()
         else:
-            pos = Position(symbol=symbol, quantity=quantity, avg_cost=price)
+            pos = Position(symbol=symbol, quantity=quantity, avg_cost=price,
+                           opened=trade_date,
+                           lots=[TaxLot(date=trade_date, quantity=quantity,
+                                        cost_per_share=price)])
             self.portfolio.positions.append(pos)
+        if thesis:
+            pos.thesis = thesis
+        if invalidation:
+            pos.invalidation = invalidation
+        self.portfolio.trades.append(TradeRecord(symbol=symbol, side="buy",
+                                                 quantity=quantity, price=price,
+                                                 date=trade_date))
         self.save()
         return pos
 
-    def sell(self, symbol: str, quantity: float, price: float) -> float:
-        """Returns realized P&L. Removes the position when fully closed."""
+    def sell(self, symbol: str, quantity: float, price: float,
+             override: bool = False, trade_date: Optional[str] = None) -> RealizedSale:
+        """FIFO sell. Returns realized P&L split into short/long-term.
+        Raises SellLockedError while the circuit breaker is engaged
+        (override=True bypasses it deliberately)."""
+        g = self.portfolio.guardrail
+        if g.is_locked() and not override:
+            raise SellLockedError(
+                f"Circuit breaker engaged until {g.locked_until} UTC — {g.reason} "
+                "Re-read your investment theses; pass override=True / --override "
+                "if you still want to sell.")
         pos = self.get_position(symbol)
         if not pos:
             raise ValueError(f"No position in {symbol}")
         if quantity > pos.quantity + 1e-9:
             raise ValueError(f"Cannot sell {quantity}, only hold {pos.quantity}")
-        realized = (price - pos.avg_cost) * quantity
-        pos.quantity -= quantity
+
+        trade_date = trade_date or date.today().isoformat()
+        remaining = quantity
+        st_gain = lt_gain = 0.0
+        consumed = 0
+        for lot in list(pos.lots):                       # FIFO
+            if remaining <= 1e-12:
+                break
+            take = min(lot.quantity, remaining)
+            gain = (price - lot.cost_per_share) * take
+            if lot.is_long_term(date.fromisoformat(trade_date)):
+                lt_gain += gain
+            else:
+                st_gain += gain
+            lot.quantity -= take
+            remaining -= take
+            consumed += 1
+            if lot.quantity <= 1e-12:
+                pos.lots.remove(lot)
+        pos.recompute_from_lots()
+
         self.portfolio.cash += quantity * price
+        self.portfolio.trades.append(TradeRecord(
+            symbol=pos.symbol, side="sell", quantity=quantity, price=price,
+            date=trade_date, short_term_gain=st_gain, long_term_gain=lt_gain))
         if pos.quantity <= 1e-9:
             self.portfolio.positions.remove(pos)
         self.save()
-        return realized
+        return RealizedSale(symbol=symbol.upper(), quantity=quantity, price=price,
+                            total=st_gain + lt_gain, short_term=st_gain,
+                            long_term=lt_gain, lots_consumed=consumed)
 
     def set_rules(self, symbol: str, *, stop_loss: float | None = None,
                   stop_limit: float | None = None, take_profit: float | None = None,
@@ -81,6 +137,18 @@ class PortfolioManager:
         if trailing_stop_pct is not None:
             r.trailing_stop_pct = trailing_stop_pct or None
             r.high_water_mark = None  # reset; will re-arm at current price
+        self.save()
+        return pos
+
+    def set_thesis(self, symbol: str, thesis: str | None = None,
+                   invalidation: str | None = None) -> Position:
+        pos = self.get_position(symbol)
+        if not pos:
+            raise ValueError(f"No position in {symbol}")
+        if thesis is not None:
+            pos.thesis = thesis
+        if invalidation is not None:
+            pos.invalidation = invalidation
         self.save()
         return pos
 

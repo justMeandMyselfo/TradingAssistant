@@ -77,16 +77,28 @@ def cmd_advise(args) -> None:
 
 def cmd_buy(args) -> None:
     mgr = PortfolioManager()
-    pos = mgr.buy(args.symbol, args.quantity, args.price)
+    pos = mgr.buy(args.symbol, args.quantity, args.price,
+                  thesis=args.thesis or "", invalidation=args.sell_if or "")
     print(f"Bought {args.quantity} {pos.symbol} @ {args.price:.2f} "
-          f"(now {pos.quantity} shares, avg cost {pos.avg_cost:.2f})")
+          f"(now {pos.quantity} shares, avg cost {pos.avg_cost:.2f}, "
+          f"{len(pos.lots)} lot(s))")
+    if not pos.thesis:
+        print("💡 Tip: record why you bought — "
+              f"journal set {pos.symbol} --thesis '...' --sell-if '...'")
 
 
 def cmd_sell(args) -> None:
+    from .tax import preview_sale
     mgr = PortfolioManager()
-    realized = mgr.sell(args.symbol, args.quantity, args.price)
-    print(f"Sold {args.quantity} {args.symbol.upper()} @ {args.price:.2f} "
-          f"— realized P&L {realized:+,.2f}")
+    check = preview_sale(mgr, args.symbol, args.quantity, args.price)
+    for lot_date, days_left, gain in check.almost_long_term:
+        print(f"💡 Lot {lot_date} turns long-term in {days_left} day(s) — waiting "
+              f"would tax its {gain:+,.2f} gain at the lower long-term rate.")
+    sale = mgr.sell(args.symbol, args.quantity, args.price,
+                    override=getattr(args, "override", False))
+    print(f"Sold {sale.quantity} {sale.symbol} @ {sale.price:.2f} — realized "
+          f"{sale.total:+,.2f} (short-term {sale.short_term:+,.2f}, "
+          f"long-term {sale.long_term:+,.2f}, {sale.lots_consumed} lot(s) FIFO)")
 
 
 def cmd_protect(args) -> None:
@@ -214,6 +226,88 @@ def cmd_sync(args) -> None:
           f"removed {result['removed'] or '—'}")
 
 
+def cmd_lots(args) -> None:
+    mgr = PortfolioManager()
+    positions = ([mgr.get_position(args.symbol)] if args.symbol
+                 else mgr.portfolio.positions)
+    for pos in positions:
+        if pos is None:
+            print(f"No position in {args.symbol}")
+            return
+        print(f"\n{pos.symbol} — {pos.quantity:,.4f} shares, avg {pos.avg_cost:,.2f}")
+        if pos.thesis:
+            print(f"  thesis: {pos.thesis}")
+        if pos.invalidation:
+            print(f"  sell if: {pos.invalidation}")
+        for lot in pos.lots:
+            term = "LT" if lot.is_long_term() else f"ST ({lot.days_to_long_term()}d to LT)"
+            print(f"  {lot.date}  {lot.quantity:>12,.4f} @ {lot.cost_per_share:>10,.2f}  [{term}]")
+
+
+def cmd_tax(args) -> None:
+    from . import tax
+    mgr = PortfolioManager()
+    if args.action == "rates":
+        from .notify import load_config, save_config
+        cfg = load_config()
+        cfg["tax_short_rate"] = args.short / 100.0
+        cfg["tax_long_rate"] = args.long / 100.0
+        save_config(cfg)
+        print(f"Tax rates saved: short-term {args.short:.0f}%, long-term {args.long:.0f}%")
+        return
+    if args.action == "summary":
+        s = tax.realized_summary(mgr)
+        print(f"Realized {s['year']}: {s['sales']} sale(s) — short-term "
+              f"{s['short_term']:+,.2f}, long-term {s['long_term']:+,.2f}, "
+              f"total {s['total']:+,.2f}; estimated tax ≈{s['est_tax']:,.2f} "
+              f"(rates {s['short_rate']:.0%}/{s['long_rate']:.0%})")
+        return
+    # harvest
+    p = _provider(args)
+    suggestions = tax.harvest_opportunities(mgr, p)
+    if not suggestions:
+        print("✓ No harvestable losses above thresholds.")
+        return
+    for s in suggestions:
+        term = "long-term" if s.is_long_term else "short-term"
+        print(f"\n{s.symbol} lot {s.lot_date}: {s.quantity:,.4f} @ "
+              f"{s.cost_per_share:,.2f} → {s.current_price:,.2f}  "
+              f"loss {s.unrealized_loss:,.2f} ({s.loss_pct:.1%}, {term})")
+        print(f"  ≈{s.est_tax_saving:,.2f} estimated tax saving if harvested")
+        if s.replacements:
+            print(f"  stay invested via: {', '.join(s.replacements)}")
+        for w in s.warnings:
+            print(f"  ⚠ {w}")
+
+
+def cmd_journal(args) -> None:
+    mgr = PortfolioManager()
+    if args.action == "set":
+        pos = mgr.set_thesis(args.symbol, thesis=args.thesis,
+                             invalidation=args.sell_if)
+        print(f"{pos.symbol} journal updated.")
+    else:
+        for pos in mgr.portfolio.positions:
+            print(f"\n{pos.symbol}:")
+            print(f"  thesis : {pos.thesis or '— (write one! future-you will panic)'}")
+            print(f"  sell if: {pos.invalidation or '—'}")
+
+
+def cmd_breaker(args) -> None:
+    from . import guardrails
+    mgr = PortfolioManager()
+    g = mgr.portfolio.guardrail
+    if args.action == "status":
+        if g.is_locked():
+            print(f"🔒 ENGAGED until {g.locked_until} UTC — {g.reason}")
+        else:
+            msg = guardrails.check_circuit_breaker(mgr)
+            print(msg or "✓ Circuit breaker not engaged.")
+    elif args.action == "release":
+        guardrails.release_circuit_breaker(mgr)
+        print("Circuit breaker released.")
+
+
 def cmd_import_csv(args) -> None:
     from .brokers import import_positions_csv
     result = import_positions_csv(PortfolioManager(), args.path,
@@ -256,15 +350,41 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--prefer", nargs="*", help="sectors to favor")
     a.set_defaults(func=cmd_advise)
 
-    b = sub.add_parser("buy", help="record a purchase")
+    b = sub.add_parser("buy", help="record a purchase (creates a tax lot)")
     b.add_argument("symbol"); b.add_argument("quantity", type=float)
     b.add_argument("price", type=float)
+    b.add_argument("--thesis", default=None, help="why you're buying")
+    b.add_argument("--sell-if", dest="sell_if", default=None,
+                   help="your pre-committed exit condition")
     b.set_defaults(func=cmd_buy)
 
-    s = sub.add_parser("sell", help="record a sale")
+    s = sub.add_parser("sell", help="record a sale (FIFO, ST/LT gain split)")
     s.add_argument("symbol"); s.add_argument("quantity", type=float)
     s.add_argument("price", type=float)
+    s.add_argument("--override", action="store_true",
+                   help="bypass the behavioral circuit breaker")
     s.set_defaults(func=cmd_sell)
+
+    lo = sub.add_parser("lots", help="show tax lots (and journal) per position")
+    lo.add_argument("symbol", nargs="?", default="")
+    lo.set_defaults(func=cmd_lots)
+
+    tx = sub.add_parser("tax", help="tax-loss harvesting & realized gains")
+    tx.add_argument("action", choices=["harvest", "summary", "rates"])
+    tx.add_argument("--short", type=float, default=30, help="short-term rate %%")
+    tx.add_argument("--long", type=float, default=15, help="long-term rate %%")
+    tx.set_defaults(func=cmd_tax)
+
+    jr = sub.add_parser("journal", help="pre-commitment thesis journal")
+    jr.add_argument("action", choices=["set", "show"])
+    jr.add_argument("symbol", nargs="?", default="")
+    jr.add_argument("--thesis", default=None)
+    jr.add_argument("--sell-if", dest="sell_if", default=None)
+    jr.set_defaults(func=cmd_journal)
+
+    br = sub.add_parser("breaker", help="behavioral circuit breaker status/release")
+    br.add_argument("action", choices=["status", "release"])
+    br.set_defaults(func=cmd_breaker)
 
     pr = sub.add_parser("protect", help="set stop-loss/take-profit/trailing rules")
     pr.add_argument("symbol")
