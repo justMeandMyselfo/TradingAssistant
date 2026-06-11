@@ -1,0 +1,10 @@
+# User portfolio data (personal, never commit)
+data/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.streamlit/secrets.toml
