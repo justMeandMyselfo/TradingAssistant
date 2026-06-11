@@ -116,11 +116,6 @@ python -m trading_assistant.cli track                 # advisor picks vs SPY
 - **Interactive Brokers**: run TWS or the free IB Gateway, enable
   *Global Configuration → API → Settings → Enable ActiveX and Socket Clients*,
   then `sync ibkr`. The connection is **read-only** — no orders are placed.
-- **Trade Republic**: there is **no official TR API**. Unofficial
-  reverse-engineered clients exist but violate TR's terms and require your real
-  banking credentials, so this project deliberately doesn't bundle one. Export
-  or type your positions into a CSV (`symbol;quantity;avg_cost`) and use
-  `import-csv` instead.
 
 The portfolio is stored in `data/portfolio.json` (git-ignored) and is shared
 between the CLI and the web app.
