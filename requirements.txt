@@ -5,3 +5,4 @@ plotly>=5.18
 streamlit>=1.32
 pytest>=7.0
 ib_async>=1.0   # optional: only needed for IBKR live sync
+anthropic>=0.69 # optional: only needed for the Claude analyst

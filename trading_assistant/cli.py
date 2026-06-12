@@ -225,6 +225,13 @@ def cmd_config(args) -> None:
         save_config(cfg)
         print("Alpaca keys saved to data/config.json (git-ignored). "
               "Paper trading is the default endpoint.")
+    elif args.key == "anthropic":
+        from .notify import load_config, save_config
+        cfg = load_config()
+        cfg["anthropic_key"] = args.value
+        save_config(cfg)
+        print("Anthropic API key saved to data/config.json (git-ignored). "
+              "The analyst commands are ready: analyst brief / analyst ask")
 
 
 def cmd_notify(args) -> None:
@@ -397,6 +404,45 @@ def cmd_alpaca(args) -> None:
               f"(order id {pl.result.get('id', '?')})")
 
 
+def cmd_screen(args) -> None:
+    from .screener import screen
+    p = _provider(args)
+    symbols = args.symbols or None
+    hits = screen(p, symbols=symbols, max_market_cap=args.max_cap * 1e9,
+                  min_dollar_volume=args.min_volume * 1e6, top=args.top)
+    if not hits:
+        print("No symbols passed the filters.")
+        return
+    hdr = (f"{'SYMBOL':>7} {'SCORE':>6} {'PRICE':>9} {'MKT CAP':>9} {'$VOL/DAY':>9} "
+           f"{'6M MOM':>8} {'SHARPE':>7} {'MAX DD':>8}  EDGE")
+    print(hdr)
+    print("-" * len(hdr))
+    for h in hits:
+        cap = f"{h.market_cap/1e9:.1f}B" if h.market_cap else "?"
+        edge = "🔒 inst. locked out" if h.institutional_locked_out else ""
+        print(f"{h.symbol:>7} {h.score:>6.1f} {h.price:>9,.2f} {cap:>9} "
+              f"{h.avg_dollar_volume/1e6:>8.1f}M {h.momentum_6m:>+7.1%} "
+              f"{h.sharpe:>7.2f} {h.max_drawdown:>+7.1%}  {edge}")
+        for note in h.notes[:2]:
+            print(f"{'':>8}· {note}")
+    print(DISCLAIMER)
+
+
+def cmd_analyst(args) -> None:
+    from .analyst import PortfolioAnalyst
+    mgr = PortfolioManager()
+    p = _provider(args)
+    analyst = PortfolioAnalyst(model=args.model)
+    if args.action == "brief":
+        print("Generating your portfolio brief…\n")
+        print(analyst.brief(mgr, p))
+    else:  # ask
+        if not args.question:
+            print("Usage: analyst ask \"your question\"")
+            return
+        print(analyst.ask(" ".join(args.question), mgr, p))
+
+
 def cmd_import_csv(args) -> None:
     from .brokers import import_positions_csv
     result = import_positions_csv(PortfolioManager(), args.path,
@@ -509,8 +555,8 @@ def build_parser() -> argparse.ArgumentParser:
     w.set_defaults(func=cmd_watch)
 
     cf = sub.add_parser("config", help="store settings (Discord webhook, Alpaca keys)")
-    cf.add_argument("key", choices=["discord", "alpaca"])
-    cf.add_argument("value", help="webhook URL, or Alpaca key id")
+    cf.add_argument("key", choices=["discord", "alpaca", "anthropic"])
+    cf.add_argument("value", help="webhook URL, Alpaca key id, or Anthropic API key")
     cf.add_argument("secret", nargs="?", default=None,
                     help="Alpaca secret (with key 'alpaca')")
     cf.set_defaults(func=cmd_config)
@@ -522,6 +568,22 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("symbols", nargs="*", help="extra symbols beyond the portfolio")
     ev.add_argument("--days", type=int, default=14)
     ev.set_defaults(func=cmd_events)
+
+    sc = sub.add_parser("screen", help="small-cap screener (the retail size edge)")
+    sc.add_argument("symbols", nargs="*",
+                    help="custom universe (default: curated small-cap list)")
+    sc.add_argument("--max-cap", type=float, default=10.0,
+                    help="max market cap in $B (default 10)")
+    sc.add_argument("--min-volume", type=float, default=0.5,
+                    help="min avg daily dollar volume in $M (default 0.5)")
+    sc.add_argument("--top", type=int, default=15)
+    sc.set_defaults(func=cmd_screen)
+
+    an = sub.add_parser("analyst", help="Claude-powered portfolio analyst")
+    an.add_argument("action", choices=["brief", "ask"])
+    an.add_argument("question", nargs="*", help="question (with 'ask')")
+    an.add_argument("--model", default="claude-opus-4-8")
+    an.set_defaults(func=cmd_analyst)
 
     ax = sub.add_parser("alpaca", help="paper-trading execution via Alpaca")
     ax.add_argument("action", choices=["status", "execute"])

@@ -51,6 +51,14 @@ A full-featured investment advisor and portfolio tracker:
   with its prices and continuously marked to market against just buying SPY:
   per-recommendation alpha, beat rate, and average alpha. If the engine can't
   beat the boring benchmark, you'll see it.
+- **🔍 Small-cap screener** — the structural retail edge: ranks a small-cap
+  universe (curated seed list, or paste your own) on quality-momentum metrics
+  with liquidity filters, and flags names whose daily dollar volume locks
+  institutions out while staying tradeable for you.
+- **🤖 Claude analyst** — a Claude-powered analyst desk over your own data:
+  one-click portfolio briefs (health, urgent alerts, tax moves, event prep,
+  next actions) and free-form Q&A ("am I overexposed to tech?"), grounded
+  strictly in your portfolio snapshot. Needs an Anthropic API key.
 
 ## Data
 
@@ -109,7 +117,51 @@ python -m trading_assistant.cli alpaca execute        # dry-run order plan
 python -m trading_assistant.cli alpaca execute --send # submit to PAPER
 python -m trading_assistant.cli watch --execute       # 24/7: alert → paper order
 python -m trading_assistant.cli track                 # advisor picks vs SPY
+
+# Screener & analyst
+python -m trading_assistant.cli screen --max-cap 5 --top 10
+python -m trading_assistant.cli screen AAOI KRUS ACMR    # your own universe
+python -m trading_assistant.cli config anthropic sk-ant-...
+python -m trading_assistant.cli analyst brief
+python -m trading_assistant.cli analyst ask "what should I do before earnings season?"
 ```
+
+## Run it on the web / your phone
+
+The web app is responsive — once it's reachable over the network, it works
+from any phone browser.
+
+**Easiest (free): Streamlit Community Cloud**
+1. Fork/own this repo on GitHub.
+2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with
+   GitHub, pick the repo, set the entry point to `app/streamlit_app.py`.
+3. You get a public `https://<name>.streamlit.app` URL — open it on your
+   phone, add it to your home screen, share it with friends.
+
+⚠️ Notes for Streamlit Cloud: the container filesystem is **ephemeral** —
+`data/portfolio.json` resets on redeploys, so it's best for the advisor,
+screener, market and backtest features, or as a demo for friends. Put secrets
+(Discord webhook, Anthropic key, Alpaca keys) in the app's *Secrets* settings
+as environment variables (`DISCORD_WEBHOOK_URL`, `ANTHROPIC_API_KEY`,
+`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`) rather than typing them into a
+public app. The app is **single-user by design** — anyone with the URL shares
+the same portfolio, so friends should deploy their own copy (that's the
+"share" model).
+
+**Private & persistent: Docker on any server**
+```bash
+docker build -t trading-assistant .
+docker run -d -p 8501:8501 -v trading_data:/app/data trading-assistant
+```
+Works on a $5/mo VPS, a Raspberry Pi, or your desktop. For phone access to a
+home server without exposing it to the internet, use
+[Tailscale](https://tailscale.com) — install it on the server and your phone,
+then open `http://<server-tailnet-name>:8501`. Same trick lets invited
+friends in privately (each should still run their own instance for their own
+portfolio).
+
+**IBKR note:** live broker sync needs TWS/IB Gateway running *next to* the
+app, so keep IBKR sync on the machine where the gateway runs.
 
 ## Broker notes
 
@@ -134,6 +186,8 @@ trading_assistant/
   guardrails.py # circuit breaker, panic-cost simulator
   events.py    # earnings dates + FOMC calendar for event-risk alerts
   tracking.py  # accountability log: advisor picks vs SPY
+  screener.py  # small-cap quality-momentum screener with liquidity edge flag
+  analyst.py   # Claude-powered portfolio briefs and Q&A
   backtest.py  # DCA vs lump-sum backtests
   cli.py       # command-line interface
 app/

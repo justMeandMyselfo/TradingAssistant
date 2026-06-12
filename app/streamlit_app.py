@@ -64,9 +64,10 @@ else:
                "**deterministic simulated data**. All features work identically; "
                "reconnect to the internet for real prices.", icon="⚠️")
 
-tab_market, tab_advisor, tab_portfolio, tab_tax, tab_track, tab_backtest = st.tabs(
+(tab_market, tab_advisor, tab_portfolio, tab_tax, tab_track, tab_backtest,
+ tab_screener, tab_analyst) = st.tabs(
     ["📊 Market", "🎯 Advisor", "💼 Portfolio", "🧾 Tax", "📋 Track record",
-     "🧪 Backtest"])
+     "🧪 Backtest", "🔍 Screener", "🤖 Analyst"])
 
 
 # ---------- price chart helper ----------
@@ -761,3 +762,134 @@ with tab_backtest:
                        "to win in steadily rising markets. Past performance ≠ future results.")
         except Exception as e:
             st.error(f"Backtest failed: {e}")
+
+
+# ====================================================================
+# TAB 7 — SMALL-CAP SCREENER
+# ====================================================================
+
+with tab_screener:
+    st.caption("The structural retail edge: companies too small for big funds "
+               "to buy without moving the price. 🔒 marks names whose daily "
+               "dollar volume locks institutions out — while staying above a "
+               "liquidity floor so you can still trade them.")
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc_max_cap = sc1.number_input("Max market cap ($B)", 0.1, 100.0, 10.0, 0.5)
+    sc_min_vol = sc2.number_input("Min daily $ volume ($M)", 0.1, 500.0, 0.5, 0.1)
+    sc_top = sc3.slider("Results", 5, 40, 15)
+    with sc4:
+        st.write("")
+        run_screen = st.button("🔍 Run screener", type="primary")
+    sc_symbols_text = st.text_area(
+        "Universe (one symbol per line — leave as-is for the curated list, or "
+        "paste your own, e.g. a Russell 2000 export)",
+        "\n".join(__import__("trading_assistant.screener",
+                             fromlist=["DEFAULT_SMALL_CAP_UNIVERSE"]
+                             ).DEFAULT_SMALL_CAP_UNIVERSE),
+        height=120)
+
+    if run_screen:
+        from trading_assistant.screener import screen
+        universe = [s.strip().upper() for s in sc_symbols_text.splitlines() if s.strip()]
+        with st.spinner(f"Screening {len(universe)} symbols…"):
+            try:
+                hits = screen(provider(), symbols=universe,
+                              max_market_cap=sc_max_cap * 1e9,
+                              min_dollar_volume=sc_min_vol * 1e6, top=sc_top)
+            except Exception as e:
+                hits = []
+                st.error(str(e))
+        if hits:
+            hit_df = pd.DataFrame([{
+                "Symbol": h.symbol, "Score": round(h.score, 1),
+                "Price": h.price,
+                "Mkt cap ($B)": round(h.market_cap / 1e9, 2) if h.market_cap else None,
+                "$ vol/day ($M)": round(h.avg_dollar_volume / 1e6, 1),
+                "6m momentum": h.momentum_6m, "Sharpe": round(h.sharpe, 2),
+                "Volatility": h.annual_volatility, "Max DD": h.max_drawdown,
+                "Uptrend": h.trend_above_sma200,
+                "🔒 Inst. locked out": h.institutional_locked_out,
+            } for h in hits])
+            st.dataframe(hit_df, use_container_width=True, hide_index=True,
+                         column_config={
+                             "Price": st.column_config.NumberColumn(format="dollar"),
+                             "6m momentum": st.column_config.NumberColumn(format="percent"),
+                             "Volatility": st.column_config.NumberColumn(format="percent"),
+                             "Max DD": st.column_config.NumberColumn(format="percent"),
+                             "Score": st.column_config.ProgressColumn(
+                                 min_value=0, max_value=100, format="%.0f"),
+                         })
+            with st.expander("Why these names?"):
+                for h in hits:
+                    if h.notes:
+                        st.markdown(f"**{h.symbol}** (score {h.score:.0f}): "
+                                    + "; ".join(h.notes))
+            st.caption("⚠️ Small caps are riskier and less covered by analysts — "
+                       "size positions accordingly and always use the journal + "
+                       "protective rules. Not financial advice.")
+        else:
+            st.info("No symbols passed the filters — loosen the cap/volume limits "
+                    "or check the universe.")
+
+
+# ====================================================================
+# TAB 8 — CLAUDE ANALYST
+# ====================================================================
+
+with tab_analyst:
+    from trading_assistant import analyst as analyst_mod
+
+    st.caption("A Claude-powered analyst desk over your own data: it sees your "
+               "positions, alerts, tax situation, events and track record — and "
+               "answers in plain English. Educational, not financial advice.")
+
+    if not analyst_mod.get_api_key():
+        st.warning("No Anthropic API key configured.", icon="🔑")
+        a_key = st.text_input("Anthropic API key", type="password",
+                              help="Create one at console.anthropic.com → API keys. "
+                                   "Stored locally in data/config.json (git-ignored).")
+        if st.button("Save API key") and a_key.strip():
+            cfg = notify.load_config()
+            cfg["anthropic_key"] = a_key.strip()
+            notify.save_config(cfg)
+            st.rerun()
+    else:
+        an1, an2 = st.columns([1, 2])
+        with an1:
+            if st.button("📋 Generate portfolio brief", type="primary"):
+                try:
+                    with st.spinner("The analyst is reading your portfolio…"):
+                        brief = analyst_mod.PortfolioAnalyst().brief(
+                            manager(), provider())
+                    st.session_state["analyst_brief"] = brief
+                except Exception as e:
+                    st.error(str(e))
+        with an2:
+            with st.form("analyst_q"):
+                question = st.text_input(
+                    "Ask the analyst",
+                    placeholder="e.g. Am I overexposed to tech? What should I do before the FOMC meeting?")
+                if st.form_submit_button("Ask") and question.strip():
+                    try:
+                        with st.spinner("Thinking…"):
+                            answer = analyst_mod.PortfolioAnalyst().ask(
+                                question, manager(), provider())
+                        st.session_state["analyst_answer"] = (question, answer)
+                    except Exception as e:
+                        st.error(str(e))
+
+        if "analyst_brief" in st.session_state:
+            st.markdown("### 📋 Portfolio brief")
+            st.markdown(st.session_state["analyst_brief"])
+        if "analyst_answer" in st.session_state:
+            q, a = st.session_state["analyst_answer"]
+            st.markdown(f"### ❓ {q}")
+            st.markdown(a)
+
+        with st.expander("What the analyst can see (your data snapshot)"):
+            try:
+                import json as _json
+                st.code(_json.dumps(analyst_mod.gather_context(
+                    manager(), provider()), indent=2), language="json")
+            except Exception as e:
+                st.error(str(e))
